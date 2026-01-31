@@ -20,12 +20,19 @@ __pycache__/
 .Pythonenv/
 venv/
 
-# Screenshots and temporary files
-screenshots/
+# But allow icons (tracked files)
+!icon64.png
+!icon128.png
+
+# Screenshots (allowed for repo demo)
+!screenshots/
+
+# Ignore other PNG files
 *.png
-*.jpg
-*.jpeg
-*.gif
+# But allow our icons and screenshots
+!icon64.png
+!icon128.png
+!/screenshots/*.png
 
 # Build output
 dist/
