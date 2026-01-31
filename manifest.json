@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Dual Subtitles - DeepLearning.AI & Coursera",
+  "version": "1.0.0",
+  "description": "Bilingual subtitles (English + Vietnamese) for DeepLearning.AI and Coursera courses. Auto-translate English subtitles to Vietnamese in real-time!",
+  "permissions": [
+    "activeTab"
+  ],
+  "action": {
+    "default_title": "Activate Dual Subtitles"
+  },
+  "icons": {
+    "64": "icon64.png",
+    "128": "icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.coursera.org/*",
+        "https://learn.deeplearning.ai/*"
+      ],
+      "js": [
+        "js/content.js"
+      ],
+      "run_at": "document_end"
+    }
+  ],
+  "background": {
+    "service_worker": "js/background.js"
+  },
+  "host_permissions": [
+    "https://translate.googleapis.com/*"
+  ]
+}

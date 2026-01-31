@@ -1,0 +1,40 @@
+# Node modules
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.Pythonenv/
+venv/
+
+# Screenshots and temporary files
+screenshots/
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Build output
+dist/
+build/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
