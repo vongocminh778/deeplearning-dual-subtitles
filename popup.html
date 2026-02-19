@@ -184,6 +184,61 @@
     .button:hover {
       background: rgba(255, 215, 0, 0.3);
     }
+
+    .preset-buttons {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .preset-btn {
+      flex: 1;
+      padding: 8px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 6px;
+      color: #fff;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .preset-btn:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+
+    .preset-btn.active {
+      background: rgba(255, 215, 0, 0.3);
+      border-color: #ffd700;
+      color: #ffd700;
+    }
+
+    .select-item {
+      margin-bottom: 16px;
+    }
+
+    .select-label {
+      display: block;
+      font-size: 12px;
+      color: rgba(255, 255, 255, 0.8);
+      margin-bottom: 6px;
+    }
+
+    .voice-select {
+      width: 100%;
+      padding: 8px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 6px;
+      color: #fff;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    .voice-select option {
+      background: #1a1a2e;
+      color: #fff;
+    }
   </style>
 </head>
 <body>
@@ -206,12 +261,22 @@
         </div>
 
         <div class="toggle-item">
-          <span class="toggle-label">Dịch sang tiếng Việt</span>
-          <div class="toggle-switch active" id="translation-toggle"></div>
+          <span class="toggle-label">Hiển thị phụ đề gốc (EN)</span>
+          <div class="toggle-switch" id="original-toggle"></div>
         </div>
 
         <div class="toggle-item">
-          <span class="toggle-label">Giọng đọc tiếng Việt</span>
+          <span class="toggle-label">Hiển thị phụ đề dịch</span>
+          <div class="toggle-switch active" id="translated-toggle"></div>
+        </div>
+
+        <div class="select-item">
+          <label class="select-label">Ngôn ngữ dịch</label>
+          <select id="language-select" class="voice-select"></select>
+        </div>
+
+        <div class="toggle-item">
+          <span class="toggle-label">Giọng đọc</span>
           <div class="toggle-switch active" id="tts-toggle"></div>
         </div>
 
@@ -224,14 +289,28 @@
     <div class="divider"></div>
 
     <div class="section">
-      <div class="section-title">Cài đặt giọng đọc</div>
+      <div class="section-title">Chế độ giọng đọc</div>
+      <div class="preset-buttons">
+        <button class="preset-btn" data-preset="natural">Tự nhiên</button>
+        <button class="preset-btn" data-preset="fast">Nhanh</button>
+        <button class="preset-btn" data-preset="slow">Chậm</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Cài đặt chi tiết</div>
+
+      <div class="select-item">
+        <label class="select-label">Chọn giọng đọc</label>
+        <select id="voice-select" class="voice-select"></select>
+      </div>
 
       <div class="slider-item">
         <div class="slider-label">
           <span>Tốc độ đọc</span>
-          <span class="slider-value" id="rate-value">1.3x</span>
+          <span class="slider-value" id="rate-value">1.5x</span>
         </div>
-        <input type="range" id="rate-slider" min="0.5" max="2.5" step="0.1" value="1.3">
+        <input type="range" id="rate-slider" min="0.5" max="2.5" step="0.1" value="1.5">
       </div>
 
       <div class="slider-item">

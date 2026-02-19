@@ -14,15 +14,29 @@
   let preTranslateQueue = null;
   let videoElement = null;
   let subtitleEnabled = true;
+  let showOriginal = false;
+  let showTranslated = true;
   let translationEnabled = true;
+  let targetLanguage = 'vi';
   let ttsEnabled = true;
   let videoMuted = true;
   let speechSynthesis = window.speechSynthesis;
   let currentUtterance = null;
   let lastSpeakTime = 0;
   let speakDebounceTimer = null;
-  let ttsRate = 1.3;
+  let speechSegments = [];
+  let currentSegmentIndex = 0;
+  let isSpeaking = false;
+  let pausedSegmentIndex = 0;
+  let pausedSegmentText = '';
+  let isPaused = false;
+  let ttsRetryCount = 0;
+  let currentTextHash = '';
+  let ttsRate = 1.5;
   let ttsPitch = 1.0;
+  let voiceIndex = null;
+  let availableVoices = [];
+  let videoPaused = false;
   let initRetryCount = 0;
   let isInitialized = false;
 
@@ -146,11 +160,13 @@
   // TRANSLATE (FAST - PARALLEL)
   // =====================
   function translateText(text) {
-    if (translationCache.has(text)) {
-      return Promise.resolve(translationCache.get(text));
+    const cacheKey = `${targetLanguage}:${text}`;
+
+    if (translationCache.has(cacheKey)) {
+      return Promise.resolve(translationCache.get(cacheKey));
     }
 
-    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=vi&dt=t&q=${encodeURIComponent(text)}`;
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=${targetLanguage}&dt=t&q=${encodeURIComponent(text)}`;
 
     return fetch(url)
       .then(r => r.json())
@@ -161,7 +177,7 @@
             translated += data[0][i][0];
           }
         }
-        translationCache.set(text, translated);
+        translationCache.set(cacheKey, translated);
         return translated || text;
       })
       .catch(err => {
@@ -172,7 +188,7 @@
 
   async function preTranslateBatch(entries) {
     const toTranslate = entries
-      .filter(e => !e.translated && !translationCache.has(e.text))
+      .filter(e => !e.translated && !translationCache.has(`${targetLanguage}:${e.text}`))
       .slice(0, CONFIG.preTranslateCount);
 
     if (toTranslate.length === 0) {
@@ -202,7 +218,21 @@
   // TEXT-TO-SPEECH (Vietnamese)
   // =====================
   function speakVietnamese(text) {
-    if (!ttsEnabled || !text || text === 'Đang dịch...') return;
+    if (!ttsEnabled || !text || text === 'Đang dịch...' || videoPaused) {
+      log('Skipping TTS: enabled=' + ttsEnabled + ', text=' + !!text + ', paused=' + videoPaused);
+      return;
+    }
+
+    const textHash = text.substring(0, 30);
+
+    if (textHash === currentTextHash) {
+      log('Same text as current, isSpeaking:', isSpeaking);
+      if (isSpeaking) {
+        return;
+      }
+    }
+
+    currentTextHash = textHash;
 
     const now = Date.now();
 
@@ -213,47 +243,296 @@
     speakDebounceTimer = setTimeout(() => {
       const timeSinceLastSpeak = now - lastSpeakTime;
 
-      if (timeSinceLastSpeak < 500) {
+      if (timeSinceLastSpeak < 200) {
+        log('Too soon to speak, debouncing');
         return;
       }
 
       lastSpeakTime = Date.now();
 
-      if (speechSynthesis.speaking) {
+      if (!videoPaused) {
+        log('Starting TTS for text:', text.substring(0, 50) + '...');
+        log('Current state - isSpeaking:', isSpeaking, 'speechSegments:', speechSegments.length);
+
         speechSynthesis.cancel();
-      }
 
-      currentUtterance = new SpeechSynthesisUtterance(text);
-      currentUtterance.lang = 'vi-VN';
-      currentUtterance.rate = ttsRate;
-      currentUtterance.pitch = ttsPitch;
-      currentUtterance.volume = 1.0;
+        const segments = splitTextIntoSegments(text);
 
-      const voices = speechSynthesis.getVoices();
-      const vietnameseVoice = voices.find(v => v.lang.includes('vi'));
-      if (vietnameseVoice) {
-        currentUtterance.voice = vietnameseVoice;
-      }
-
-      currentUtterance.onstart = () => log('Speaking...');
-      currentUtterance.onend = () => log('Finished speaking');
-      currentUtterance.onerror = (e) => {
-        if (e.error !== 'interrupted' && e.error !== 'canceled') {
-          error('TTS error:', e);
+        if (segments.length === 0) {
+          log('No segments to speak');
+          return;
         }
-      };
 
-      speechSynthesis.speak(currentUtterance);
-    }, 300);
+        log('Text split into', segments.length, 'segments');
+
+        currentSegmentIndex = 0;
+        pausedSegmentIndex = 0;
+        speechSegments = segments;
+
+        log('Starting to speak from segment 0');
+        startSpeakingFromSegment(0);
+      } else {
+        log('Video paused, not starting TTS');
+      }
+    }, 150);
   }
+
+  function splitTextIntoSegments(text) {
+    text = text.replace(/\s+/g, ' ').trim();
+    log('Splitting text:', text.substring(0, 100) + '...');
+
+    const sentences = [];
+
+    const splitPoints = [];
+
+    const sentenceEndRegex = /[.!?]+(\s+|$)/g;
+    let match;
+    while ((match = sentenceEndRegex.exec(text)) !== null) {
+      splitPoints.push({
+        index: match.index,
+        end: match.index + match[0].length,
+        type: 'sentence'
+      });
+    }
+
+    const commaRegex = /[,;]+(\s+|$)/g;
+    while ((match = commaRegex.exec(text)) !== null) {
+      splitPoints.push({
+        index: match.index,
+        end: match.index + match[0].length,
+        type: 'comma'
+      });
+    }
+
+    splitPoints.sort((a, b) => a.index - b.index);
+
+    let lastEnd = 0;
+
+    for (const point of splitPoints) {
+      if (point.index < lastEnd) continue;
+
+      const segment = text.substring(lastEnd, point.end).trim();
+
+      if (!segment) continue;
+
+      if (point.type === 'sentence') {
+        sentences.push(segment);
+        lastEnd = point.end;
+      } else if (point.type === 'comma') {
+        const words = segment.split(/\s+/);
+        const lastWord = words[words.length - 1] || '';
+        const lastWordClean = lastWord.toLowerCase().replace(/[,;]/g, '');
+
+        const connectives = [
+          'and', 'or', 'but', 'yet', 'so', 'nor', 'for',
+          'và', 'hoặc', 'nhưng', 'nên', 'vì', 'tuy', 'tuy nhiên',
+          'song', 'mà', 'để', 'khiến cho', 'làm cho'
+        ];
+
+        if (!connectives.includes(lastWordClean)) {
+          sentences.push(segment);
+          lastEnd = point.end;
+        }
+      }
+    }
+
+    const remaining = text.substring(lastEnd).trim();
+    if (remaining) {
+      sentences.push(remaining);
+    }
+
+    const result = sentences.filter(s => s.length > 0);
+    log('Split into', result.length, 'segments');
+    result.forEach((s, i) => {
+      log(`  ${i + 1}. "${s.substring(0, 40)}..."`);
+    });
+
+    return result;
+  }
+
+  function startSpeakingFromSegment(index) {
+    if (index >= speechSegments.length) {
+      isSpeaking = false;
+      currentSegmentIndex = 0;
+      speechSegments = [];
+      pausedSegmentIndex = 0;
+      log('Finished all segments');
+      return;
+    }
+
+    isSpeaking = true;
+    currentSegmentIndex = index;
+    pausedSegmentIndex = index;
+
+    const segment = speechSegments[index];
+    log('Speaking segment', index, ':', segment);
+
+    const utterance = new SpeechSynthesisUtterance(segment);
+    utterance.lang = targetLanguage + '-' + targetLanguage.toUpperCase();
+    utterance.rate = ttsRate;
+    utterance.pitch = ttsPitch;
+    utterance.volume = 1.0;
+
+    const voices = speechSynthesis.getVoices();
+    if (voiceIndex !== null && voices[voiceIndex]) {
+      utterance.voice = voices[voiceIndex];
+      log('Using voice index:', voiceIndex, voices[voiceIndex].name);
+    } else {
+      const targetVoice = voices.find(v => v.lang.startsWith(targetLanguage));
+      if (targetVoice) {
+        utterance.voice = targetVoice;
+        voiceIndex = voices.indexOf(targetVoice);
+        log('Auto-selected voice:', targetVoice.name);
+      } else {
+        log(`WARNING: No ${targetLanguage} voice found, using default`);
+      }
+    }
+
+    log('Speaking with rate:', utterance.rate, 'pitch:', utterance.pitch);
+
+    let utteranceStarted = false;
+
+    utterance.onstart = () => {
+      log('✓ TTS started for segment', index);
+      pausedSegmentText = segment;
+      ttsRetryCount = 0;
+      utteranceStarted = true;
+    };
+
+    utterance.onend = () => {
+      log('✓ TTS ended for segment', index);
+      pausedSegmentText = '';
+      pausedSegmentIndex = index + 1;
+      setTimeout(() => {
+        if (isSpeaking && speechSegments.length > 0 && index + 1 < speechSegments.length) {
+          log('Moving to next segment', index + 1);
+          startSpeakingFromSegment(index + 1);
+        } else {
+          isSpeaking = false;
+          log('Finished speaking all segments');
+        }
+      }, 50);
+    };
+
+    utterance.onboundary = (event) => {
+      if (event.name === 'word') {
+        pausedSegmentText = segment.substring(0, event.charIndex);
+      }
+    };
+
+    utterance.onerror = (e) => {
+      error('✗ TTS error for segment', index, ':', e.error, 'started:', utteranceStarted);
+
+      if (e.error === 'not-allowed' || e.error === 'not-supported') {
+        if (ttsRetryCount < 2) {
+          ttsRetryCount++;
+          log('Retrying TTS (' + ttsRetryCount + '/2) for segment', index);
+          setTimeout(() => {
+            startSpeakingFromSegment(index);
+          }, 200);
+        } else {
+          log('TTS not allowed after retries, skipping');
+          isSpeaking = false;
+          pausedSegmentText = '';
+          speechSegments = [];
+          currentTextHash = '';
+          pausedSegmentIndex = 0;
+        }
+      } else if (e.error !== 'interrupted' && e.error !== 'canceled') {
+        if (isSpeaking) {
+          log('TTS error, moving to next segment');
+          setTimeout(() => {
+            startSpeakingFromSegment(index + 1);
+          }, 100);
+        } else {
+          isSpeaking = false;
+          log('Not speaking anymore after error');
+        }
+      } else {
+        if (!utteranceStarted) {
+          isSpeaking = false;
+          log('TTS error before start, clearing speaking state');
+        }
+      }
+    };
+
+    currentUtterance = utterance;
+    speechSynthesis.speak(utterance);
+    log('speechSynthesis.speak() called');
+  }
+
+  function pauseSpeaking() {
+    isPaused = true;
+    if (speechSynthesis.speaking) {
+      pausedSegmentIndex = currentSegmentIndex;
+      pausedSegmentText = speechSegments[currentSegmentIndex] || '';
+      speechSynthesis.cancel();
+      log('✓ Paused at segment', pausedSegmentIndex, ':', pausedSegmentText);
+    } else {
+      log('Nothing to pause, not speaking');
+    }
+  }
+
+  function resumeSpeaking() {
+    isPaused = false;
+    log('Resume called. Segments:', speechSegments.length, 'Paused index:', pausedSegmentIndex);
+    if (speechSegments.length > 0 && pausedSegmentIndex < speechSegments.length) {
+      log('✓ Resuming from segment', pausedSegmentIndex, ':', speechSegments[pausedSegmentIndex]);
+      currentTextHash = '';
+      startSpeakingFromSegment(pausedSegmentIndex);
+    } else {
+      log('Cannot resume: no segments or invalid index');
+    }
+  }
+
+  function stopSpeaking() {
+    isSpeaking = false;
+    isPaused = false;
+    currentSegmentIndex = 0;
+    pausedSegmentIndex = 0;
+    speechSegments = [];
+    pausedSegmentText = '';
+    currentTextHash = '';
+    ttsRetryCount = 0;
+    speechSynthesis.cancel();
+    if (speakDebounceTimer) {
+      clearTimeout(speakDebounceTimer);
+      speakDebounceTimer = null;
+    }
+  }
+
+  function resetTTSState() {
+    stopSpeaking();
+    videoPaused = false;
+  }
+
+  function loadVoices() {
+    availableVoices = speechSynthesis.getVoices();
+    const langVoices = availableVoices.filter(v => v.lang.startsWith(targetLanguage));
+    log('Loaded voices:', availableVoices.length, `${targetLanguage} voices:`, langVoices.length);
+
+    if (langVoices.length > 0) {
+      langVoices.forEach((v, i) => {
+        log(`  ${i + 1}. ${v.name} (${v.lang})`);
+      });
+    }
+
+    if (voiceIndex === null && langVoices.length > 0) {
+      voiceIndex = availableVoices.indexOf(langVoices[0]);
+      log('Auto-selected voice:', langVoices[0].name);
+    }
+  }
+
+  speechSynthesis.onvoiceschanged = loadVoices;
+  loadVoices();
 
   // Load voices
   if (speechSynthesis.onvoiceschanged !== undefined) {
     speechSynthesis.onvoiceschanged = () => {
       const voices = speechSynthesis.getVoices();
-      const viVoices = voices.filter(v => v.lang.includes('vi'));
+      const langVoices = voices.filter(v => v.lang.startsWith(targetLanguage));
       log('Available voices:', voices.length);
-      log('Vietnamese voices:', viVoices.length);
+      log(`${targetLanguage} voices:`, langVoices.length);
     };
   }
 
@@ -323,6 +602,10 @@
     newOverlay.id = 'dual-subtitles-overlay';
     newOverlay.innerHTML = `
       <button class="ds-reset-btn" title="Vị trí gốc">↺</button>
+      <div class="ds-resize-handle ds-resize-nw" data-direction="nw"></div>
+      <div class="ds-resize-handle ds-resize-ne" data-direction="ne"></div>
+      <div class="ds-resize-handle ds-resize-sw" data-direction="sw"></div>
+      <div class="ds-resize-handle ds-resize-se" data-direction="se"></div>
       <div class="ds-content">
         <div class="ds-original"></div>
         <div class="ds-translated"></div>
@@ -341,6 +624,9 @@
       border-radius: 8px !important;
       max-width: 85% !important;
       min-width: 200px !important;
+      width: auto !important;
+      height: auto !important;
+      min-height: auto !important;
       text-align: center !important;
       z-index: 2147483646 !important;
       font-size: ${CONFIG.fontSize} !important;
@@ -350,6 +636,7 @@
       display: none !important;
       box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
       border: 1px solid rgba(255,255,255,0.1) !important;
+      resize: none !important;
     `;
 
     const contentDiv = newOverlay.querySelector('.ds-content');
@@ -398,6 +685,85 @@
 
     newOverlay.addEventListener('mouseleave', () => {
       resetBtn.style.opacity = '0';
+    });
+
+    // Resize handles - 4 corners
+    const resizeHandles = newOverlay.querySelectorAll('.ds-resize-handle');
+
+    resizeHandles.forEach(handle => {
+      const direction = handle.dataset.direction;
+
+      if (direction === 'nw') {
+        handle.style.cssText = `
+          position: absolute !important;
+          top: 0 !important;
+          left: 0 !important;
+          width: 20px !important;
+          height: 20px !important;
+          background: linear-gradient(135deg, rgba(255, 215, 0, 0.6) 50%, transparent 50%) !important;
+          border-radius: 8px 0 0 0 !important;
+          cursor: nwse-resize !important;
+          z-index: 2147483648 !important;
+          pointer-events: auto !important;
+          opacity: 0.5 !important;
+          transition: opacity 0.2s !important;
+        `;
+      } else if (direction === 'ne') {
+        handle.style.cssText = `
+          position: absolute !important;
+          top: 0 !important;
+          right: 0 !important;
+          width: 20px !important;
+          height: 20px !important;
+          background: linear-gradient(225deg, rgba(255, 215, 0, 0.6) 50%, transparent 50%) !important;
+          border-radius: 0 8px 0 0 !important;
+          cursor: nesw-resize !important;
+          z-index: 2147483648 !important;
+          pointer-events: auto !important;
+          opacity: 0.5 !important;
+          transition: opacity 0.2s !important;
+        `;
+      } else if (direction === 'sw') {
+        handle.style.cssText = `
+          position: absolute !important;
+          bottom: 0 !important;
+          left: 0 !important;
+          width: 20px !important;
+          height: 20px !important;
+          background: linear-gradient(45deg, rgba(255, 215, 0, 0.6) 50%, transparent 50%) !important;
+          border-radius: 0 0 0 8px !important;
+          cursor: nesw-resize !important;
+          z-index: 2147483648 !important;
+          pointer-events: auto !important;
+          opacity: 0.5 !important;
+          transition: opacity 0.2s !important;
+        `;
+      } else if (direction === 'se') {
+        handle.style.cssText = `
+          position: absolute !important;
+          bottom: 0 !important;
+          right: 0 !important;
+          width: 20px !important;
+          height: 20px !important;
+          background: linear-gradient(315deg, rgba(255, 215, 0, 0.6) 50%, transparent 50%) !important;
+          border-radius: 0 0 8px 0 !important;
+          cursor: nwse-resize !important;
+          z-index: 2147483648 !important;
+          pointer-events: auto !important;
+          opacity: 0.5 !important;
+          transition: opacity 0.2s !important;
+        `;
+      }
+
+      handle.addEventListener('mouseenter', () => {
+        handle.style.opacity = '1';
+      });
+
+      handle.addEventListener('mouseleave', () => {
+        if (!handle.classList.contains('resizing')) {
+          handle.style.opacity = '0.5';
+        }
+      });
     });
 
     container.appendChild(newOverlay);
@@ -511,16 +877,150 @@
 
     document.addEventListener('touchend', endDrag);
 
+    // === RESIZE FUNCTIONALITY ===
+    let isResizing = false;
+    let resizeDirection = '';
+    let resizeStartX = 0, resizeStartY = 0;
+    let initialWidth = 0, initialHeight = 0;
+    let resizeInitialLeft = 0, resizeInitialBottom = 0;
+
+    function startResize(clientX, clientY, direction) {
+      isResizing = true;
+      resizeDirection = direction;
+
+      resizeHandles.forEach(h => h.classList.add('resizing'));
+      resizeHandles.forEach(h => h.style.opacity = '1');
+
+      resizeStartX = clientX;
+      resizeStartY = clientY;
+
+      initialWidth = newOverlay.offsetWidth;
+      initialHeight = newOverlay.offsetHeight;
+
+      const rect = newOverlay.getBoundingClientRect();
+      const containerRect = container.getBoundingClientRect();
+
+      if (newOverlay.style.left.includes('%')) {
+        resizeInitialLeft = rect.left - containerRect.left + rect.width / 2;
+      } else {
+        resizeInitialLeft = parseFloat(newOverlay.style.left);
+      }
+      if (newOverlay.style.bottom.includes('%')) {
+        resizeInitialBottom = containerRect.bottom - rect.bottom;
+      } else {
+        resizeInitialBottom = parseFloat(newOverlay.style.bottom);
+      }
+    }
+
+    function doResize(clientX, clientY) {
+      if (!isResizing) return;
+
+      const dx = clientX - resizeStartX;
+      const dy = clientY - resizeStartY;
+
+      let newWidth = initialWidth;
+      let newHeight = initialHeight;
+      let newLeft = resizeInitialLeft;
+      let newBottom = resizeInitialBottom;
+
+      if (resizeDirection.includes('e')) {
+        newWidth = Math.max(200, initialWidth + dx);
+      }
+      if (resizeDirection.includes('w')) {
+        newWidth = Math.max(200, initialWidth - dx);
+        newLeft = resizeInitialLeft + dx / 2;
+      }
+      if (resizeDirection.includes('s')) {
+        newHeight = Math.max(60, initialHeight - dy);
+      }
+      if (resizeDirection.includes('n')) {
+        newHeight = Math.max(60, initialHeight + dy);
+        newBottom = resizeInitialBottom + dy;
+      }
+
+      const containerRect = container.getBoundingClientRect();
+
+      newLeft = Math.max(newWidth / 2, Math.min(containerRect.width - newWidth / 2, newLeft));
+      newBottom = Math.max(10, Math.min(containerRect.height - newHeight - 10, newBottom));
+
+      newOverlay.style.width = newWidth + 'px';
+      newOverlay.style.maxWidth = newWidth + 'px';
+      newOverlay.style.height = 'auto';
+      newOverlay.style.minHeight = newHeight + 'px';
+
+      if (resizeDirection.includes('w') || resizeDirection.includes('n')) {
+        newOverlay.style.left = newLeft + 'px';
+        newOverlay.style.bottom = newBottom + 'px';
+        newOverlay.style.transform = 'translateX(-50%)';
+      }
+    }
+
+    function endResize() {
+      if (isResizing) {
+        isResizing = false;
+        resizeDirection = '';
+        resizeHandles.forEach(h => h.classList.remove('resizing'));
+        resizeHandles.forEach(h => h.style.opacity = '0.5');
+      }
+    }
+
+    // Mouse events for resize
+    resizeHandles.forEach(handle => {
+      handle.addEventListener('mousedown', (e) => {
+        startResize(e.clientX, e.clientY, handle.dataset.direction);
+        e.preventDefault();
+        e.stopPropagation();
+      });
+
+      handle.addEventListener('touchstart', (e) => {
+        const touch = e.touches[0];
+        startResize(touch.clientX, touch.clientY, handle.dataset.direction);
+        e.preventDefault();
+        e.stopPropagation();
+      });
+    });
+
+    document.addEventListener('mousemove', (e) => {
+      if (isResizing) {
+        doResize(e.clientX, e.clientY);
+        e.preventDefault();
+      }
+    });
+
+    document.addEventListener('mouseup', () => {
+      if (isResizing) {
+        endResize();
+      }
+    });
+
+    document.addEventListener('touchmove', (e) => {
+      if (isResizing) {
+        const touch = e.touches[0];
+        doResize(touch.clientX, touch.clientY);
+        e.preventDefault();
+      }
+    });
+
+    document.addEventListener('touchend', () => {
+      if (isResizing) {
+        endResize();
+      }
+    });
+
     // Reset button
     resetBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       newOverlay.style.left = originalPosition.left;
       newOverlay.style.bottom = originalPosition.bottom;
       newOverlay.style.transform = 'translateX(-50%)';
+      newOverlay.style.width = 'auto';
+      newOverlay.style.maxWidth = '85%';
+      newOverlay.style.height = 'auto';
+      newOverlay.style.minHeight = 'auto';
       dragHandleEl.style.left = '50%';
       dragHandleEl.style.bottom = originalPosition.bottom;
       dragHandleEl.style.transform = 'translateX(-50%)';
-      log('Overlay position reset');
+      log('Overlay position and size reset');
     });
 
     overlay = newOverlay;
@@ -536,14 +1036,17 @@
     log('Video muted:', videoMuted);
 
     videoElement.addEventListener('pause', () => {
-      if (speechSynthesis.speaking) {
-        speechSynthesis.cancel();
-        log('Video paused, TTS stopped');
+      videoPaused = true;
+      if (speechSynthesis.speaking || speechSegments.length > 0) {
+        pauseSpeaking();
+        log('Video paused, TTS paused');
       }
     });
 
     videoElement.addEventListener('play', () => {
-      log('Video resumed, TTS ready');
+      videoPaused = false;
+      resumeSpeaking();
+      log('Video resumed, TTS resumed');
     });
 
     const originalDiv = overlay.querySelector('.ds-original');
@@ -564,14 +1067,22 @@
 
         if (subtitleEnabled) {
           overlay.style.display = 'block';
-          originalDiv.textContent = active.text;
 
-          if (translationEnabled) {
+          if (showOriginal) {
+            originalDiv.style.display = 'block';
+            originalDiv.textContent = active.text;
+          } else {
+            originalDiv.style.display = 'none';
+          }
+
+          if (showTranslated && translationEnabled) {
+            translatedDiv.style.display = 'block';
+
             if (active.translated) {
               translatedDiv.textContent = active.translated;
               speakVietnamese(active.translated);
-            } else if (translationCache.has(active.text)) {
-              active.translated = translationCache.get(active.text);
+            } else if (translationCache.has(`${targetLanguage}:${active.text}`)) {
+              active.translated = translationCache.get(`${targetLanguage}:${active.text}`);
               translatedDiv.textContent = active.translated;
               speakVietnamese(active.translated);
             } else {
@@ -585,7 +1096,8 @@
               });
             }
           } else {
-            translatedDiv.textContent = '';
+            translatedDiv.style.display = 'none';
+            stopSpeaking();
           }
         }
 
@@ -593,7 +1105,7 @@
       } else if (!active && currentText && Date.now() - lastTextChange > 500) {
         currentText = '';
         overlay.style.display = 'none';
-        speechSynthesis.cancel();
+        stopSpeaking();
       }
 
     }, CONFIG.syncInterval);
@@ -694,9 +1206,7 @@
       clearTimeout(speakDebounceTimer);
       speakDebounceTimer = null;
     }
-    if (speechSynthesis) {
-      speechSynthesis.cancel();
-    }
+    resetTTSState();
     if (overlay && overlay.parentElement) {
       overlay.remove();
     }
@@ -713,6 +1223,42 @@
   // =====================
   // STARTUP
   // =====================
+  let ttsEnabledViaInteraction = false;
+
+  function enableTTS() {
+    if (speechSynthesis && !ttsEnabledViaInteraction) {
+      try {
+        const testUtterance = new SpeechSynthesisUtterance('');
+        testUtterance.volume = 0;
+        speechSynthesis.speak(testUtterance);
+        speechSynthesis.cancel();
+        ttsEnabledViaInteraction = true;
+        log('✓ TTS enabled via user interaction');
+      } catch (e) {
+        error('✗ Failed to enable TTS:', e);
+      }
+    } else {
+      log('TTS already enabled or not available');
+    }
+  }
+
+  function waitForUserInteraction() {
+    const enableHandler = () => {
+      enableTTS();
+      document.removeEventListener('click', enableHandler);
+      document.removeEventListener('keydown', enableHandler);
+      document.removeEventListener('touchstart', enableHandler);
+    };
+
+    document.addEventListener('click', enableHandler);
+    document.addEventListener('keydown', enableHandler);
+    document.addEventListener('touchstart', enableHandler);
+
+    log('Waiting for user interaction to enable TTS...');
+  }
+
+  waitForUserInteraction();
+
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
       log('DOMContentLoaded, waiting for video...');
@@ -747,8 +1293,34 @@
           sendResponse({ status: 'ok' });
           break;
 
+        case 'toggle-original':
+          showOriginal = request.data.enabled;
+          log('Original subtitle:', showOriginal ? 'ON' : 'OFF');
+          sendResponse({ status: 'ok' });
+          break;
+
+        case 'toggle-translated':
+          showTranslated = request.data.enabled;
+          if (!showTranslated) {
+            stopSpeaking();
+          }
+          log('Translated subtitle:', showTranslated ? 'ON' : 'OFF');
+          sendResponse({ status: 'ok' });
+          break;
+
+        case 'set-language':
+          targetLanguage = request.data.language;
+          log('Target language changed to:', targetLanguage);
+          voiceIndex = null;
+          loadVoices();
+          sendResponse({ status: 'ok' });
+          break;
+
         case 'toggle-translation':
           translationEnabled = request.data.enabled;
+          if (!translationEnabled) {
+            stopSpeaking();
+          }
           log('Translation:', translationEnabled ? 'ON' : 'OFF');
           sendResponse({ status: 'ok' });
           break;
@@ -756,9 +1328,13 @@
         case 'toggle-tts':
           ttsEnabled = request.data.enabled;
           if (!ttsEnabled) {
-            speechSynthesis.cancel();
+            stopSpeaking();
+          } else {
+            log('✓ TTS turned ON, resetting state');
+            currentTextHash = '';
+            videoPaused = false;
           }
-          log('TTS:', ttsEnabled ? 'ON' : 'OFF');
+          log('✓ TTS:', ttsEnabled ? 'ON' : 'OFF');
           sendResponse({ status: 'ok' });
           break;
 
@@ -773,25 +1349,38 @@
 
         case 'set-rate':
           ttsRate = request.data.rate;
-          log('TTS rate:', ttsRate);
+          log('✓ TTS rate updated to:', ttsRate);
           sendResponse({ status: 'ok' });
           break;
 
         case 'set-pitch':
           ttsPitch = request.data.pitch;
-          log('TTS pitch:', ttsPitch);
+          log('✓ TTS pitch updated to:', ttsPitch);
+          sendResponse({ status: 'ok' });
+          break;
+
+        case 'set-voice':
+          voiceIndex = request.data.voiceIndex;
+          const voices = speechSynthesis.getVoices();
+          const selectedVoice = voices[voiceIndex];
+          log('✓ Voice index changed to:', voiceIndex, selectedVoice ? `(${selectedVoice.name})` : '');
           sendResponse({ status: 'ok' });
           break;
 
         case 'get-settings':
           sendResponse({
             subtitleEnabled,
+            showOriginal,
+            showTranslated,
             translationEnabled,
+            targetLanguage,
             ttsEnabled,
             videoMuted,
             ttsRate,
-            ttsPitch
+            ttsPitch,
+            voiceIndex
           });
+          resetTTSState();
           break;
 
         default:
