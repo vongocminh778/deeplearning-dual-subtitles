@@ -12,6 +12,19 @@
   let checkInterval = null;
   let currentVttUrl = null;
   let preTranslateQueue = null;
+  let videoElement = null;
+  let subtitleEnabled = true;
+  let translationEnabled = true;
+  let ttsEnabled = true;
+  let videoMuted = true;
+  let speechSynthesis = window.speechSynthesis;
+  let currentUtterance = null;
+  let lastSpeakTime = 0;
+  let speakDebounceTimer = null;
+  let ttsRate = 1.3;
+  let ttsPitch = 1.0;
+  let initRetryCount = 0;
+  let isInitialized = false;
 
   const CONFIG = {
     overlayBackground: 'rgba(0, 0, 0, 0.85)',
@@ -186,6 +199,65 @@
   }
 
   // =====================
+  // TEXT-TO-SPEECH (Vietnamese)
+  // =====================
+  function speakVietnamese(text) {
+    if (!ttsEnabled || !text || text === 'Đang dịch...') return;
+
+    const now = Date.now();
+
+    if (speakDebounceTimer) {
+      clearTimeout(speakDebounceTimer);
+    }
+
+    speakDebounceTimer = setTimeout(() => {
+      const timeSinceLastSpeak = now - lastSpeakTime;
+
+      if (timeSinceLastSpeak < 500) {
+        return;
+      }
+
+      lastSpeakTime = Date.now();
+
+      if (speechSynthesis.speaking) {
+        speechSynthesis.cancel();
+      }
+
+      currentUtterance = new SpeechSynthesisUtterance(text);
+      currentUtterance.lang = 'vi-VN';
+      currentUtterance.rate = ttsRate;
+      currentUtterance.pitch = ttsPitch;
+      currentUtterance.volume = 1.0;
+
+      const voices = speechSynthesis.getVoices();
+      const vietnameseVoice = voices.find(v => v.lang.includes('vi'));
+      if (vietnameseVoice) {
+        currentUtterance.voice = vietnameseVoice;
+      }
+
+      currentUtterance.onstart = () => log('Speaking...');
+      currentUtterance.onend = () => log('Finished speaking');
+      currentUtterance.onerror = (e) => {
+        if (e.error !== 'interrupted' && e.error !== 'canceled') {
+          error('TTS error:', e);
+        }
+      };
+
+      speechSynthesis.speak(currentUtterance);
+    }, 300);
+  }
+
+  // Load voices
+  if (speechSynthesis.onvoiceschanged !== undefined) {
+    speechSynthesis.onvoiceschanged = () => {
+      const voices = speechSynthesis.getVoices();
+      const viVoices = voices.filter(v => v.lang.includes('vi'));
+      log('Available voices:', voices.length);
+      log('Vietnamese voices:', viVoices.length);
+    };
+  }
+
+  // =====================
   // CREATE DRAG HANDLE (always visible)
   // =====================
   function createDragHandle(container) {
@@ -250,11 +322,11 @@
     const newOverlay = document.createElement('div');
     newOverlay.id = 'dual-subtitles-overlay';
     newOverlay.innerHTML = `
+      <button class="ds-reset-btn" title="Vị trí gốc">↺</button>
       <div class="ds-content">
         <div class="ds-original"></div>
         <div class="ds-translated"></div>
       </div>
-      <button class="ds-reset-btn" title="Vị trí gốc">↺</button>
     `;
 
     // Default positioning
@@ -459,6 +531,21 @@
   // SYNC WITH VIDEO
   // =====================
   function startVideoSync(video, entries) {
+    videoElement = video;
+    videoElement.muted = videoMuted;
+    log('Video muted:', videoMuted);
+
+    videoElement.addEventListener('pause', () => {
+      if (speechSynthesis.speaking) {
+        speechSynthesis.cancel();
+        log('Video paused, TTS stopped');
+      }
+    });
+
+    videoElement.addEventListener('play', () => {
+      log('Video resumed, TTS ready');
+    });
+
     const originalDiv = overlay.querySelector('.ds-original');
     const translatedDiv = overlay.querySelector('.ds-translated');
     let currentText = '';
@@ -475,28 +562,38 @@
         currentText = active.text;
         lastTextChange = Date.now();
 
-        overlay.style.display = 'block';
-        originalDiv.textContent = active.text;
+        if (subtitleEnabled) {
+          overlay.style.display = 'block';
+          originalDiv.textContent = active.text;
 
-        if (active.translated) {
-          translatedDiv.textContent = active.translated;
-        } else if (translationCache.has(active.text)) {
-          active.translated = translationCache.get(active.text);
-          translatedDiv.textContent = active.translated;
-        } else {
-          translatedDiv.textContent = 'Đang dịch...';
-          translateText(active.text).then(translated => {
-            active.translated = translated;
-            if (currentText === active.text) {
-              translatedDiv.textContent = translated;
+          if (translationEnabled) {
+            if (active.translated) {
+              translatedDiv.textContent = active.translated;
+              speakVietnamese(active.translated);
+            } else if (translationCache.has(active.text)) {
+              active.translated = translationCache.get(active.text);
+              translatedDiv.textContent = active.translated;
+              speakVietnamese(active.translated);
+            } else {
+              translatedDiv.textContent = 'Đang dịch...';
+              translateText(active.text).then(translated => {
+                active.translated = translated;
+                if (currentText === active.text) {
+                  translatedDiv.textContent = translated;
+                  speakVietnamese(translated);
+                }
+              });
             }
-          });
+          } else {
+            translatedDiv.textContent = '';
+          }
         }
 
         log('Show:', active.text);
       } else if (!active && currentText && Date.now() - lastTextChange > 500) {
         currentText = '';
         overlay.style.display = 'none';
+        speechSynthesis.cancel();
       }
 
     }, CONFIG.syncInterval);
@@ -508,14 +605,26 @@
   // MAIN INITIALIZATION
   // =====================
   async function init() {
-    log('=== Initializing Dual Subtitles (Parallel + Draggable) ===');
-
-    const video = document.querySelector('video');
-    if (!video) {
-      error('No video element found');
+    if (isInitialized) {
+      log('Already initialized');
       return;
     }
 
+    log('=== Initializing Dual Subtitles (Parallel + Draggable + TTS) ===');
+
+    const video = document.querySelector('video');
+    if (!video) {
+      initRetryCount++;
+      if (initRetryCount < 20) {
+        log(`Video not found, retrying... (${initRetryCount}/20)`);
+        setTimeout(init, 1000);
+      } else {
+        error('No video element found after retries');
+      }
+      return;
+    }
+
+    videoElement = video;
     log('Found video element');
 
     const vttUrl = getSubtitleUrl(video);
@@ -568,6 +677,9 @@
     }, 2000);
 
     preTranslateBatch(entries);
+
+    isInitialized = true;
+    log('=== Dual Subtitles Fully Initialized ===');
   }
 
   function cleanup() {
@@ -578,6 +690,13 @@
     if (preTranslateQueue) {
       preTranslateQueue = null;
     }
+    if (speakDebounceTimer) {
+      clearTimeout(speakDebounceTimer);
+      speakDebounceTimer = null;
+    }
+    if (speechSynthesis) {
+      speechSynthesis.cancel();
+    }
     if (overlay && overlay.parentElement) {
       overlay.remove();
     }
@@ -587,36 +706,105 @@
     overlay = null;
     dragHandle = null;
     subtitleEntries = [];
+    isInitialized = false;
+    initRetryCount = 0;
   }
 
   // =====================
   // STARTUP
   // =====================
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => setTimeout(init, 2000));
+    document.addEventListener('DOMContentLoaded', () => {
+      log('DOMContentLoaded, waiting for video...');
+      setTimeout(init, 500);
+    });
   } else {
-    setTimeout(init, 2000);
+    log('Document ready, starting init...');
+    setTimeout(init, 500);
   }
 
   let lastUrl = location.href;
   new MutationObserver(() => {
     if (location.href !== lastUrl) {
       lastUrl = location.href;
+      log('URL changed, reinitializing...');
       cleanup();
-      setTimeout(init, 3000);
+      setTimeout(init, 1000);
     }
   }).observe(document, { subtree: true, childList: true });
 
   if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
     chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-      cleanup();
-      init();
-      sendResponse({ status: 'ok' });
+      log('Received message:', request.type, request.data);
+
+      switch (request.type) {
+        case 'toggle-subtitle':
+          subtitleEnabled = request.data.enabled;
+          if (!subtitleEnabled) {
+            overlay.style.display = 'none';
+          }
+          log('Subtitle:', subtitleEnabled ? 'ON' : 'OFF');
+          sendResponse({ status: 'ok' });
+          break;
+
+        case 'toggle-translation':
+          translationEnabled = request.data.enabled;
+          log('Translation:', translationEnabled ? 'ON' : 'OFF');
+          sendResponse({ status: 'ok' });
+          break;
+
+        case 'toggle-tts':
+          ttsEnabled = request.data.enabled;
+          if (!ttsEnabled) {
+            speechSynthesis.cancel();
+          }
+          log('TTS:', ttsEnabled ? 'ON' : 'OFF');
+          sendResponse({ status: 'ok' });
+          break;
+
+        case 'toggle-mute':
+          videoMuted = request.data.muted;
+          if (videoElement) {
+            videoElement.muted = videoMuted;
+          }
+          log('Video muted:', videoMuted);
+          sendResponse({ status: 'ok' });
+          break;
+
+        case 'set-rate':
+          ttsRate = request.data.rate;
+          log('TTS rate:', ttsRate);
+          sendResponse({ status: 'ok' });
+          break;
+
+        case 'set-pitch':
+          ttsPitch = request.data.pitch;
+          log('TTS pitch:', ttsPitch);
+          sendResponse({ status: 'ok' });
+          break;
+
+        case 'get-settings':
+          sendResponse({
+            subtitleEnabled,
+            translationEnabled,
+            ttsEnabled,
+            videoMuted,
+            ttsRate,
+            ttsPitch
+          });
+          break;
+
+        default:
+          cleanup();
+          init();
+          sendResponse({ status: 'ok' });
+      }
+
       return true;
     });
   }
 
   window.addEventListener('beforeunload', cleanup);
 
-  log('Dual Subtitles script loaded (Always-visible drag handle)');
+  log('Dual Subtitles script loaded (Auto-start)');
 })();
